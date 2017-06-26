@@ -7,7 +7,7 @@
 # Version 0.2 - Added error checking, summary_cdp_found list,
 #               minor bugs fixed, added error logging
 # Version 0.3 - Don't change if description already present 
-#
+# Version 0.4 - WIP
 ################################################################
 
 
@@ -421,6 +421,8 @@ def main():
                 #######################################################################################
                 ### :START: Parse SHOW CDP NEIGHBOR DETAIL 
                 #######################################################################################
+                commandList = []
+
                 if args.change or args.cdpCSV or args.cdpFound:
                     logger.info(create_logger_message("\tParsing 'show cdp neighbor detail' output...."))  
 
@@ -430,7 +432,6 @@ def main():
                     remoteName = ''
                     localPort = ''
                     network_devices = {}
-                    commandList = []
 
                     #######################################################################################
                     ### :START: Parse through cdp output 
