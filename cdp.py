@@ -4,6 +4,8 @@
 # Written by: Brian Franklin (brian.franklin@emc.com)
 #
 # Version 0.1 - Initial Release
+# Version 0.2 - Added error checking, summary_cdp_found list,
+#               minor bugs fixed, added error logging
 #
 ################################################################
 
@@ -16,6 +18,7 @@ import os.path
 import pprint
 import argparse
 import logging
+from inspect import currentframe, getframeinfo
 from colorlog import ColoredFormatter
 from contextlib import contextmanager
 @contextmanager
@@ -42,15 +45,19 @@ def nonblank_lines(f):
 
 
 def write_file(data,path,filename,mode):
-    outputFilename = path + "/"+ filename
-    outfile = open(outputFilename, mode)
-    outfile.write(data)
-    outfile.close()
+    logger = logging.getLogger('CDP')
+    try:
+        outputFilename = path + "/"+ filename
+        outfile = open(outputFilename, mode)
+        outfile.write(data)
+        outfile.close()
+    except:
+        logger.error(create_logger_message ("Error writing file: "+outputFilename))
 
     return
 
 
-def create_error_message (error):
+def create_logger_message (error):
     '''
     ### Creates a formatted error message
     '''
@@ -59,25 +66,17 @@ def create_error_message (error):
     return error_msg
 
 
-def skip_host(host,username,password,opath,bfile):
-    logger = logging.getLogger('CDP')
-
-    logger.warning(create_error_message ("Check credentials and permissions on "+host+". Problem trying to execute command. Skipping host."))
-    write_file(host+","+username+","+password+"\n",opath,bfile,'a')
-
-    return
-
-
 def multi_command(remote_conn, commands, waitHowLong, waitForString):
     
     ### Only errors are returned
     logger = logging.getLogger('CDP')
-    logger.debug(create_error_message ("Multi_command: "))
+    logger.debug(create_logger_message ("Multi_command: "))
     
     for command in commands:
-        if (send_command(remote_conn,command,waitHowLong,waitForString)) == 1:
-            return 1
-    return 0
+        (error,output)=send_command(remote_conn,command,waitHowLong,waitForString)
+        if error:
+            return (True,output)
+    return (False,"")
 
 
 def send_command(remote_conn, command, waitHowLong, waitForString):
@@ -92,7 +91,7 @@ def send_command(remote_conn, command, waitHowLong, waitForString):
     remote_conn.send(command)
 
     command = command.strip("\n")
-    logger.debug(create_error_message ("Running ("+str(command)+")"+"; Waiting for ("+waitForString+"); Will wait for ("+str(waitHowLong)+") seconds"))
+    logger.debug(create_logger_message ("Running ("+str(command)+")"+"; Waiting for ("+waitForString+"); Will wait for ("+str(waitHowLong)+") seconds"))
 
     ### Wait for the command to complete
     timeout = time.time()+waitHowLong
@@ -101,31 +100,36 @@ def send_command(remote_conn, command, waitHowLong, waitForString):
    
     output = " "
 
-
     while waitForString not in output: 
-        output = remote_conn.recv(50000)
-        logger.debug(create_error_message ("Output: "+str(output)))
+        try:
+            output = remote_conn.recv(50000)
+        
+        except:
+            logger.error(create_logger_message ("OUTPUT Messed up!"))
+            return (True,"send_command--OUTPUT Messed up!")
+
+        logger.debug(create_logger_message ("Output: "+str(output)))
 
 
         if "AAA_AUTHOR_STATUS_METHOD" in output or "Permission denied" in output:
             ### try to get out of any mode you are in & jump out
             remote_conn.send("end\n")
-            logger.error(create_error_message ("Permissions: Not allowed to execute that command ("+command+")"))
-            return 1
+            logger.error(create_logger_message ("Permissions: Not allowed to execute that command ("+command+")"))
+            return (True,"Permissions: Not allowed to execute that command ("+command+")")
         elif "Invalid command at" in output:
-            logger.error(create_error_message ("Invalid: Not allowed to execute that command ("+command+")"))
-            return 1
+            logger.error(create_logger_message ("Invalid: Not allowed to execute that command ("+command+")"))
+            return (True,"Invalid: Not allowed to execute that command ("+command+")")
         elif time.time() < timeout:
-            logger.debug(create_error_message ("Checking for timeout "))
+            logger.debug(create_logger_message ("Checking for timeout "))
             time.sleep(1)
         else:
-            logger.debug(create_error_message ("Command timed out waiting for "+waitForString))
-            return 1
-        logger.debug(create_error_message ("Still looking for ("+waitForString+")"))        
+            logger.debug(create_logger_message ("Command timed out waiting for "+waitForString))
+            return (True,"Command timed out waiting for "+waitForString)
+        logger.debug(create_logger_message ("Still looking for ("+waitForString+")"))        
 
-    logger.debug(create_error_message ("Command complete. ("+command+")"))
+    logger.debug(create_logger_message ("Command complete. ("+command+")"))
 
-    return output
+    return (False,output)
 
 
 def establish_connection(ip, username='', password=''):
@@ -139,8 +143,12 @@ def establish_connection(ip, username='', password=''):
         remote_conn_pre.set_missing_host_key_policy(
             paramiko.AutoAddPolicy())
 
-        remote_conn_pre.connect(ip, username=username, password=password,
+        try:
+            remote_conn_pre.connect(ip, username=username, password=password,
                             look_for_keys=False, allow_agent=False)
+        except:
+            logger.error(create_logger_message ("SSH Connection failed for "+ip))
+            return (0,0) 
 
         remote_conn = remote_conn_pre.invoke_shell()
     except paramiko.AuthenticationException:
@@ -214,8 +222,15 @@ def main():
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], 
         help="Set the logging level ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL') " + color.BOLD + "(default: %(default)s)" + color.END)
 
+    parser.add_argument(
+        '-log', 
+        default='logfile.log', 
+        dest='logFile', 
+        help="Set the logfile name. Location will be output path." + color.BOLD + "(default: %(default)s)" + color.END)
+
 
     args = parser.parse_args()
+
 
     #######################################################################################
     ### Create logging setup
@@ -227,13 +242,15 @@ def main():
     numLogLevel = getattr(logging,args.logLevel.upper())
 
     if not isinstance(numLogLevel, int):
-        raise ValueError(create_error_message('Invalid log level: '+args.logLevel))
+        raise ValueError(create_logger_message('Invalid log level: '+args.logLevel))
 
     logger.setLevel(numLogLevel)
 
     ### create console handler and set level to debug
     ch = logging.StreamHandler()
     ch.setLevel(numLogLevel)
+
+    fl = logging.FileHandler(args.outputPath + "/" + args.logFile,"w")
 
     ### create formatter
     formatter = ColoredFormatter(
@@ -257,7 +274,10 @@ def main():
     ### add ch to logger
     logger.addHandler(ch)
 
-    logger.debug(create_error_message("Supplied arguments: "+str(args)))
+    ### add fl to logger
+    logger.addHandler(fl)
+
+    logger.debug(create_logger_message("Supplied arguments: "+str(args)))
 
     #######################################################################################
     ### Pull devices and login information from file
@@ -265,10 +285,11 @@ def main():
     ### Check if hosts file exists and is readable
     if not (os.path.isfile(args.hostsFile) and os.access(args.hostsFile, os.R_OK)):
         
-        logger.critical(create_error_message("hostsFile "+args.hostsFile + " NOT FOUND!"))
+        logger.critical(create_logger_message("hostsFile "+args.hostsFile + " NOT FOUND!"))
         exit(1)
 
     credentials = {}
+
 
     #######################################################################################
     ### :START: Loop through hostsFile and gather credentials
@@ -281,10 +302,10 @@ def main():
             password=line.split(",")[2]
             try:
                 credentials[host]['username']
-                logger.warning(create_error_message("Duplicate host found ("+host+") skipping"))
+                logger.warning(create_logger_message("Duplicate host found ("+host+") skipping"))
                 continue
             except KeyError:
-                logger.debug(create_error_message("Host not duplicate ("+host+")"))
+                logger.debug(create_logger_message("Host not duplicate ("+host+")"))
                 pass
 
             credentials[host]={}
@@ -300,22 +321,23 @@ def main():
 
     if args.cdpCSV:
 
-        logger.debug(create_error_message("\tAdding header to cdpCSV"))
+        logger.debug(create_logger_message("\tAdding header to cdpCSV"))
         write_file("localHost,localPort,remoteName,remotePort,remoteMgmt\n",args.outputPath + "/",args.cdpCSV,'w')
 
     #######################################################################################
     ### List of found cdp neighbors for summary file; Create list 
     #######################################################################################
     if args.cdpFound:
-        summary_found_cdp = []
+        summary_found_cdp = {}
 
     #######################################################################################
     ### :START Loop 1: Loop through all hosts in credentials file
     #######################################################################################
     for hosts in credentials:
-
-        logger.debug(create_error_message("### :START Loop 1: Loop through all hosts in credentials file"))
-        logger.debug(create_error_message("Connecting to " + hosts))
+        error_msg=''            
+        
+        logger.debug(create_logger_message("### :START Loop 1: Loop through all hosts in credentials file"))
+        logger.debug(create_logger_message("Connecting to " + hosts))
 
         (remote_conn_pre, remote_conn) = establish_connection(hosts, 
                     credentials[hosts]['username'], credentials[hosts]['password'])
@@ -325,22 +347,20 @@ def main():
         #######################################################################################
         ### :START: Try section:
         #######################################################################################
-
-            logger.debug(create_error_message("### :START: Try Section:"))
-
+            logger.debug(create_logger_message("### :START: Try Section:"))
             #######################################################################################
             ### :START: If remote connection open 
             #######################################################################################
             if remote_conn_pre != 0:
-                logger.debug(create_error_message("### :START: If remote connection open "))
+                logger.debug(create_logger_message("### :START: If remote connection open "))
 
                 ### Get switch name
-                logger.debug(create_error_message("Getting switch hostname from  " + hosts)) 
+                logger.debug(create_logger_message("Getting switch hostname from  " + hosts)) 
 
-                output=send_command(remote_conn,"sh run | inc hostname\n",10,"hostname ")
-                if output == 1:
-                    logger.error(create_error_message("sh run | inc hostname"))
-                    #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+                (error,output)=send_command(remote_conn,"sh run | inc hostname|switchname\n",10,"hostname ")
+                if error:
+                    logger.error(create_logger_message("sh run | inc hostname|switchname"))
+                    error_msg = output
                     raise 
 
                 sp=output.split("\n")
@@ -350,37 +370,46 @@ def main():
                         sp[i] = sp[i].strip()
                         if 'hostname ' in sp[i]:
                             switchname = sp[i].lstrip('hostname ').rstrip()
-                            #break
+                        if 'switchname ' in sp[i]:
+                            switchname = sp[i].lstrip('switchname ').rstrip()
+
+                if switchname == '':
+                    logger.error(create_logger_message("hostname/switchname not found"))
+                    error_msg = "hostname/switchname not found"
+                    raise
 
                 ### Turn off --- MORE ---                                                       
-                logger.debug(create_error_message("Turn off --- MORE ---"))  
-                trashcan = send_command(remote_conn,"\n",5,switchname)
+                logger.debug(create_logger_message("Turn off --- MORE ---"))  
 
+                (trash1,trash2) = send_command(remote_conn,"\n",5,switchname)
 
-                if (send_command(remote_conn,"terminal length 0\n",5,switchname)) == 1:
-                    logger.error(create_error_message("terminal length 0"))
-                    #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+                (error,output) = send_command(remote_conn,"terminal length 0\n",5,switchname)
+                if error:
+                    logger.error(create_logger_message("terminal length 0"))
+                    error_msg = output 
                     raise
                  
-                logger.debug(create_error_message("Collecting 'show cdp neighbor detail' output...."))  
+                logger.debug(create_logger_message("Collecting 'show cdp neighbor detail' output...."))  
 
-                trashcan = send_command(remote_conn,"\n",5,switchname)
-                output = send_command(remote_conn,"show cdp neighbor detail\n",3600,switchname+"#")
-                if output == 1:
-                    logger.error(create_error_message("show cdp neighbor detail"))
-                    #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+                (trash1,trash2) = send_command(remote_conn,"\n",5,switchname)
+
+
+                (error,output) = send_command(remote_conn,"show cdp neighbor detail\n",180,switchname+"#")
+                if error:
+                    logger.error(create_logger_message("show cdp neighbor detail"))
+                    error_msg = output
                     raise 
      
-                logger.debug(create_error_message("Writing show cdp neighbor detail ("+hosts+")"))
+                logger.debug(create_logger_message("Writing show cdp neighbor detail ("+hosts+")"))
 
                 write_file(output,args.outputPath + "/",hosts + "-" + args.cdpSuffix,'w')
 
 
                 #######################################################################################
-                ### :START: if args.change or args.cdpCSV 
+                ### :START: Parse SHOW CDP NEIGHBOR DETAIL 
                 #######################################################################################
-                if args.change or args.cdpCSV:
-                    logger.debug(create_error_message("### :START: if args.change or args.cdpCSV     "))
+                if args.change or args.cdpCSV or args.cdpFound:
+                    logger.debug(create_logger_message("### :START: Parse SHOW CDP NEIGHBOR DETAIL      "))
                     sp = output.split("\n")
 
                     remoteName = ''
@@ -389,20 +418,20 @@ def main():
                     commandList = []
 
                     #######################################################################################
-                    ### :START Loop 2: for i in range(len(sp)):  ### Parse through cdp output 
+                    ### :START: Parse through cdp output 
                     #######################################################################################
                     for i in range(len(sp)):
-                        logger.debug(create_error_message("### :START Loop 2: for i in range(len(sp)):  ### Parse through cdp output"))
+                        logger.debug(create_logger_message("### :START: Parse through cdp output    "))
 
                         sp[i] = sp[i].strip()
                         
-                        logger.debug(create_error_message("\tline = " + sp[i]))
+                        logger.debug(create_logger_message("\tline = " + sp[i]))
 
                         ### Reset at divider                                                            
                         if '----------------' in sp[i]:
                             if remoteName and localPort:
 
-                                logger.debug(create_error_message("Creating CDP list"))
+                                logger.debug(create_logger_message("Creating CDP list"))
 
                                 network_devices[localPort] = {}
                                 network_devices[localPort]['localPort'] = localPort
@@ -410,35 +439,41 @@ def main():
                                 network_devices[localPort]['remotePort'] = remotePort
                                 network_devices[localPort]['remoteMgmt'] = remoteMgmt
                                 
+                                ### If wanting list of all cdp found devices
+                                if args.cdpFound:
+                                    summary_found_cdp[remoteName]['mgmt'] = remoteMgmt
+
+
                                 ### If cdp parsed CSV                                                           
                                 if args.cdpCSV:
         
-                                    logger.debug(create_error_message("\tAdding " +hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+" to "+args.cdpCSV))
+                                    logger.debug(create_logger_message("\tAdding " +hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+" to "+args.cdpCSV))
 
                                     write_file(hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+"\n",args.outputPath + "/",args.cdpCSV,'a')
 
                                 ### If change descriptions
                                 if args.change:
 
-                                    logger.debug(create_error_message("Creating command list"))
+                                    logger.debug(create_logger_message("Creating command list"))
                                     
                                     commandList.append('configure terminal\n')
 
                                     description = network_devices[localPort]['localPort'] + " <-> " + network_devices[localPort]['remoteName'] + " " + network_devices[localPort]['remotePort']
 
-                                    logger.debug(create_error_message("interface " + network_devices[localPort]['localPort'] + "\n" +
+                                    logger.debug(create_logger_message("interface " + network_devices[localPort]['localPort'] + "\n" +
                                         "description " + description + "\n"))
 
                                     commandList.append("interface " + network_devices[localPort]['localPort'] + "\n")
                                     commandList.append("description " + description + "\n")
 
-                                    logger.debug(create_error_message("Exiting config mode"))
+                                    logger.debug(create_logger_message("Exiting config mode"))
 
                                     commandList.append("end\n")
-
-                                    if (multi_command(remote_conn,commandList,10,switchname)):
-                                        logger.debug(create_error_message("Error: "+commandList))
-                                        #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+                                    
+                                    (error,output) = multi_command(remote_conn,commandList,10,switchname)
+                                    if error:
+                                        logger.error(create_logger_message("Error: "+commandList))
+                                        error_msg = output
                                         raise                                    
      
                             ### Reset cdp variables
@@ -454,10 +489,17 @@ def main():
                             remoteName = sp[i].split('Device ID:')[1]
                             remoteName = remoteName.split('(')[0]
                             
-                            if args.cdpFound and (remoteName not in summary_found_cdp):
-                                summary_found_cdp.append(remoteName)
+                            if args.cdpFound:
+                                try:
+                                    summary_found_cdp[remoteName]['mgmt']
+                                    logger.debug(create_logger_message("checking if "+remoteName+" already in summary list"))
+                                    continue
+                                except KeyError:
+                                    logger.debug(create_logger_message(remoteName+" NOT already in summary list.  Adding"))
+                                    summary_found_cdp[remoteName] = {}
+                                    pass
 
-                            logger.debug(create_error_message("remoteName = " + remoteName))
+                            logger.debug(create_logger_message("remoteName = " + remoteName))
 
 
                         ### Process in/out ports
@@ -465,7 +507,7 @@ def main():
                             localPort = sp[i].lstrip('Interface: ').split(',')[0]
                             remotePort = sp[i].split('port): ')[1] 
                                 
-                            logger.debug(create_error_message("localPort = " + localPort + "; remotePort = " + remotePort))
+                            logger.debug(create_logger_message("localPort = " + localPort + "; remotePort = " + remotePort))
 
 
                         ### Process MGMT address
@@ -473,94 +515,101 @@ def main():
                             
                             remoteMgmt = sp[i+1].lstrip('IPv4 Address: ').rstrip()
 
-                            logger.debug(create_error_message("mgmt ip = " + remoteMgmt))
+                            logger.debug(create_logger_message("mgmt ip = " + remoteMgmt))
 
-                    logger.debug(create_error_message("### :END Loop 2: for i in range(len(sp)):  ### Parse through cdp output"))
+                    logger.debug(create_logger_message("### :END: Parse through cdp output"))
                     #######################################################################################
-                    ### :END Loop 2: for i in range(len(sp)):  ### Parse through cdp output 
+                    ### :END: Parse through cdp output 
                     #######################################################################################
-                logger.debug(create_error_message("### :END: if args.change or args.cdpCSV"))
+
+                    #######################################################################################
+                    ### :START: Grab last entry if there
+                    #######################################################################################
+
+                    if remoteName and localPort:
+                        logger.debug(create_logger_message("### :START: Grab last entry if there"))
+
+                        logger.debug(create_logger_message("\tAdding last entry " + remoteName + " " +localPort))
+
+                        network_devices[localPort] = {}
+                        network_devices[localPort]['remoteName'] = remoteName
+                        network_devices[localPort]['localPort'] = localPort
+                        network_devices[localPort]['remotePort'] = remotePort
+                        network_devices[localPort]['remoteMgmt'] = remoteMgmt
+
+                        ### If wanting list of all cdp found devices
+                        if args.cdpFound:
+                            summary_found_cdp[remoteName]['mgmt'] = remoteMgmt
+
+                        ### If cdp parsed CSV
+                        if args.cdpCSV:
+
+                            logger.debug(create_logger_message("\tAdding " +hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+" to cdpCSV"))
+                            write_file(hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+"\n",args.outputPath + "/",args.cdpCSV,'a')
+
+                        ### If change descriptions
+                        if args.change:
+
+                            logger.debug(create_logger_message("Creating command list"))
+                            
+                            commandList.append('configure terminal\n')
+
+                            description = network_devices[localPort]['localPort'] + " <-> " + network_devices[localPort]['remoteName'] + " " + network_devices[localPort]['remotePort']
+
+                            logger.debug(create_logger_message("interface " + network_devices[localPort]['localPort'] + "\n" +
+                                "description " + description + "\n"))
+
+                            commandList.append("interface " + network_devices[localPort]['localPort'] + "\n")
+                            commandList.append("description " + description + "\n")
+
+                            logger.debug(create_logger_message("Exiting config mode"))
+
+                            commandList.append("end\n")
+
+                            (error,output) = multi_command(remote_conn,commandList,10,switchname)
+                            if error:
+                                logger.error(create_logger_message("Error: "+commandList))
+                                error_msg = output
+                                raise                                    
+
+                        logger.debug(create_logger_message("### :END: Grab last entry if there"))
+
+                    #######################################################################################
+                    ### :END: Grab last entry if there
+                    #######################################################################################
+                logger.debug(create_logger_message("### :END: Parse SHOW CDP NEIGHBOR DETAIL"))
                 #######################################################################################
-                ### :END: if args.change or args.cdpCSV 
-                #######################################################################################
-
-                #######################################################################################
-                ### :START: Grab last entry if there
-                #######################################################################################
-
-                if remoteName and localPort:
-                    logger.debug(create_error_message("### :START: Grab last entry if there"))
-
-                    logger.debug(create_error_message("\tAdding last entry " + remoteName + " " +localPort))
-
-                    network_devices[localPort] = {}
-                    network_devices[localPort]['remoteName'] = remoteName
-                    network_devices[localPort]['localPort'] = localPort
-                    network_devices[localPort]['remotePort'] = remotePort
-                    network_devices[localPort]['remoteMgmt'] = remoteMgmt
-
-                    ### If cdp parsed CSV
-                    if args.cdpCSV:
-
-                        logger.debug(create_error_message("\tAdding " +hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+" to cdpCSV"))
-                        write_file(hosts+","+localPort+","+remoteName+","+remotePort+","+remoteMgmt+"\n",args.outputPath + "/",args.cdpCSV,'a')
-
-                    ### If change descriptions
-                    if args.change:
-
-                        logger.debug(create_error_message("Creating command list"))
-                        
-                        commandList.append('configure terminal\n')
-
-                        description = network_devices[localPort]['localPort'] + " <-> " + network_devices[localPort]['remoteName'] + " " + network_devices[localPort]['remotePort']
-
-                        logger.debug(create_error_message("interface " + network_devices[localPort]['localPort'] + "\n" +
-                            "description " + description + "\n"))
-
-                        commandList.append("interface " + network_devices[localPort]['localPort'] + "\n")
-                        commandList.append("description " + description + "\n")
-
-                        logger.debug(create_error_message("Exiting config mode"))
-
-                        commandList.append("end\n")
-
-                        if (multi_command(remote_conn,commandList,10,switchname)):
-                            logger.error(create_error_message(commandList))
-                            #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
-                            raise                                    
-
-                #######################################################################################
-                ### :END: Grab last entry if there
+                ### :END: Parse SHOW CDP NEIGHBOR DETAIL 
                 #######################################################################################
 
                 if args.change:
 
-                    logger.debug(create_error_message("Saving config on "+hosts))
+                    logger.debug(create_logger_message("Saving config on "+hosts))
 
-                    output = send_command(remote_conn,"copy run start\n",180,switchname)
-                    if (output == 1):
-                        logger.error(create_error_message("copy run start"))
-                        #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+                    (error,output) = send_command(remote_conn,"copy run start\n",180,switchname)
+                    if error:
+                        logger.error(create_logger_message("copy run start"))
+                        error_msg = output
                         raise
     
-                    logger.debug(create_error_message("FINISHED changing descriptions on "+hosts))
-                logger.debug(create_error_message("### :END: Grab last entry if there"))
+                    logger.debug(create_logger_message("FINISHED changing descriptions on "+hosts))
+                logger.debug(create_logger_message("### :END: Grab last entry if there"))
 
                 ### Save done hosts
-                logger.debug(create_error_message("\tAdding done host ("+hosts+")"))
+                logger.debug(create_logger_message("\tAdding done host ("+hosts+")"))
                 write_file(hosts+","+credentials[hosts]['username']+","+credentials[hosts]['password']+"\n",args.outputPath,args.doneHostsFile,'a')
             
-                logger.debug(create_error_message("### :END: If remote connection open"))
+                logger.debug(create_logger_message("### :END: If remote connection open"))
             #######################################################################################
             ### :END: If remote connection open 
             #######################################################################################
 
             else:
+                logger.error(create_logger_message("end of try section for remote_conn_pre != 0.  Should I be here?"))
+                error_msg = "end of try section for remote_conn_pre != 0.  Should I be here?" 
                 raise   
-                ### Can't login to host
-                #skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
 
-            logger.debug(create_error_message("### :END: Try Section:"))
+            logger.debug(create_logger_message("### :END: Try Section:"))
 
         except:
             #######################################################################################
@@ -568,31 +617,34 @@ def main():
             #######################################################################################
 
             ### Can't login to host
-            logger.debug(create_error_message("### :Except Section:"))
-            logger.debug(create_error_message("### "+ str(sys.exc_info())))
-            skip_host(hosts,credentials[hosts]['username'],credentials[hosts]['password'],args.outputPath,args.badHostsFile)
+            logger.error(create_logger_message("### :Except Section:"))
+            logger.error(create_logger_message("### "+ str(sys.exc_info())))
+            write_file(hosts+","+credentials[hosts]['username']+","+credentials[hosts]['password']+","+error_msg,args.outputPath,args.badHostsFile,"a")
+            error_msg=''            
 
         finally:
             ### Close ssh connection
-            logger.debug(create_error_message("### :Finally Section:"))
-            remote_conn_pre.close()
+            logger.debug(create_logger_message("### :Finally Section:"))
+            if remote_conn_pre != 0:
+                logger.debug(create_logger_message("### Close ssh connection"))
+                remote_conn_pre.close()
 
-        logger.debug(create_error_message("### :END Loop 1: Loop through all hosts in credentials file"))
+        logger.debug(create_logger_message("### :END Loop 1: Loop through all hosts in credentials file"))
         #######################################################################################
         ### :END Loop 1: Loop through all hosts in credentials file
         #######################################################################################
     
 
     if args.cdpFound:
-        logger.debug(create_error_message("Creating "+args.cdpFound))
-        logger.debug(create_error_message("\tList contains: "+str(summary_found_cdp)))
+        logger.debug(create_logger_message("Creating "+args.cdpFound))
+        logger.debug(create_logger_message("\tList contains: "+str(summary_found_cdp)))
 
         ### Write cdp found file
         for found in summary_found_cdp:
-            logger.debug(create_error_message("\tAdding "+found))
-            write_file(found+"\n",args.outputPath,args.cdpFound,'w')            
+            logger.debug(create_logger_message("\tAdding "+found))
+            write_file(found+","+summary_found_cdp[found]['mgmt']+"\n",args.outputPath,args.cdpFound,'a')            
 
-    logger.debug(create_error_message("DONE with all hosts!"))
+    logger.debug(create_logger_message("DONE with all hosts!"))
 
 
 if __name__ == "__main__":
